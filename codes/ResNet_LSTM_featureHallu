@@ -1,0 +1,167 @@
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+import numpy as np
+import matplotlib.pyplot as plt
+from torchvision import datasets
+from torch.utils.data import DataLoader, random_split
+
+class MovingMNISTDataset(torch.utils.data.Dataset):
+    def __init__(self, num_samples=1000, num_frames=20, image_size=64, digit_size=28, num_digits=1, transform=None):
+        self.num_samples = num_samples
+        self.num_frames = num_frames
+        self.image_size = image_size
+        self.digit_size = digit_size
+        self.num_digits = num_digits
+        self.transform = transform
+        self.mnist = datasets.MNIST(root='./data', train=True, download=True, transform=transforms.ToTensor())
+        self.data, self.labels = self._generate_data()
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        label = self.labels[idx]
+        if self.transform:
+            sample = self.transform(sample)
+        sample = (sample).permute(1, 0, 2)
+    
+        return sample, label
+
+    def _generate_data(self):
+        data = np.zeros((self.num_samples, self.num_frames, self.image_size, self.image_size), dtype=np.float32)
+        labels = np.zeros((self.num_samples, self.num_frames, 2), dtype=np.float32)
+        for i in range(self.num_samples):
+            sample, label = self._generate_sample()
+            data[i] = sample
+            labels[i] = label
+        return data, labels
+
+    def _generate_sample(self):
+        sample = np.zeros((self.num_frames, self.image_size, self.image_size), dtype=np.float32)
+        labels = np.zeros((self.num_frames, 2), dtype=np.float32)
+        digit_image, _ = self.mnist[np.random.randint(0, len(self.mnist))]
+        digit_image = digit_image.numpy().squeeze()
+
+        x = np.random.randint(0, self.image_size - self.digit_size)
+        y = np.random.randint(0, self.image_size - self.digit_size)
+
+        frequency_x = np.random.uniform(0.1, 0.5)
+        frequency_y = np.random.uniform(0.1, 0.5)
+
+        w = torch.arange(0, self.num_frames)
+
+        x_velocity = 6 * np.sin(frequency_x * w)
+        y_velocity = 6 * np.sin(frequency_y * w)
+
+        for t in range(self.num_frames):
+            frame = np.zeros((self.image_size, self.image_size), dtype=np.float32)
+            x += int(x_velocity[t] + np.random.uniform(-1.5, 1.5))
+            y += int(y_velocity[t] + np.random.uniform(-1.5, 1.5))
+            x = np.clip(x, 0, self.image_size - self.digit_size)
+            y = np.clip(y, 0, self.image_size - self.digit_size)
+            frame[x:x+self.digit_size, y:y+self.digit_size] = digit_image
+            sample[t] = frame
+            labels[t] = [x, y]
+
+        return sample, labels
+
+class ResNetLSTM(nn.Module):
+    def __init__(self, resnet_output_size, lstm_hidden_size, lstm_num_layers, final_output_size):
+        super(ResNetLSTM, self).__init__()
+        self.resnet = models.resnet18(pretrained=True)
+        self.resnet.fc = nn.Identity()
+        self.resnet.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.resnet_output_size = resnet_output_size
+        self.lstm1 = nn.LSTM(resnet_output_size, lstm_hidden_size, lstm_num_layers, dropout=0.2, batch_first=True)  # latent
+        self.lstm2 = nn.LSTM(lstm_hidden_size, lstm_hidden_size, lstm_num_layers, batch_first=True)  # hallucination
+        self.fc = nn.Linear(lstm_hidden_size, final_output_size)
+
+    def forward(self, x):
+        batch_size, seq_len, h, w = x.size()
+        features = torch.zeros(batch_size, seq_len, self.resnet_output_size, device=x.device)
+
+        for t in range(seq_len):
+            img = x[:, t, :, :]
+            img = img.unsqueeze(1)  # Add channel dimension
+            features[:, t, :] = self.resnet(img)
+
+        lstm1_out, _ = self.lstm1(features)
+        lstm2_out, _ = self.lstm2(lstm1_out)
+        out = self.fc(lstm2_out[:, :, :])
+
+        return out, features, lstm1_out[:, :, :], lstm2_out[:, :, :]
+
+
+def feature_hallu_loss(H_state, L_state, features):
+    return criterion(features[:,1:,:], L_state[:,:-1,:]) +  criterion(features[:,2:,:], H_state[:,:-2,:])
+
+resnet_output_size = 512
+lstm_hidden_size = 512
+lstm_num_layers = 1
+final_output_size = 2
+
+dataset = MovingMNISTDataset(num_samples=100, num_frames=20, image_size=64, digit_size=28, num_digits=1, transform=transforms.ToTensor())
+
+train_size = 80
+test_size = 20
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+
+
+ 
+
+test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)
+
+model = ResNetLSTM(resnet_output_size, lstm_hidden_size, lstm_num_layers, final_output_size)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+def train(model, train_loader, criterion, optimizer, num_epochs=10):
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            optimizer.zero_grad()
+            out, features, lstm1_out, lstm2_out = model(inputs)
+            loss = criterion(out, labels[:, :, :])+ 0.1* feature_hallu_loss(lstm2_out, lstm1_out, features)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(train_loader)}")
+
+def evaluate(model, test_loader, criterion):
+    model.eval()
+    test_loss = 0.0
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            out, features, lstm1_out, lstm2_out = model(inputs)
+            loss = criterion(out, labels[:, :, :])
+            test_loss += loss.item()
+            
+            for i in range(2):
+                fig, axs = plt.subplots(2, 20, figsize=(20, 2))
+                for t in range(20):
+                    axs[0, t].imshow(inputs[i, t].numpy().squeeze(), cmap='gray')
+                    axs[0, t].axis('off')
+
+                    gt_x, gt_y = labels[i, t]
+                    pred_x, pred_y = out[i,t,:].round().int()
+
+                    diff_x = int(pred_x - gt_x)
+                    diff_y = int(pred_y - gt_y)
+
+                    shifted_image = np.roll(inputs[i, t].numpy().squeeze(), shift=(diff_y, diff_x), axis=(0, 1))
+
+                    axs[1, t].imshow(shifted_image, cmap='gray')
+                    axs[1, t].axis('off')
+
+                plt.show()
+          
+    print(f"Test Loss: {test_loss/len(test_loader)}")
+
+train(model, train_loader, criterion, optimizer, num_epochs=20)
+evaluate(model, test_loader, criterion)
