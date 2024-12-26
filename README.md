@@ -2,7 +2,7 @@
 The major code is still under development since the paper has not been published, and the real world experiment is still in progress.
 
 Dataset: A sample dataset of the ball rolling off a terrain is provided. To visaulize it, 
-1. use animation tool such as Paraview
+1. Use animation tool such as Paraview
 2. Open other/output.pvd
 3. In Paraview, apply gravity before click start
 4. Visualize the ball dropping
